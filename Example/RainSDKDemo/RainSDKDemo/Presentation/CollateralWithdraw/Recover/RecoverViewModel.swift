@@ -1,6 +1,5 @@
 import Foundation
 import RainSDK
-import PortalSwift
 
 /// ViewModel for the recover wallet popup. Portal-only; requires Rain API access token from Collateral Withdraw entry.
 @MainActor
@@ -9,7 +8,7 @@ class RecoverViewModel: ObservableObject {
   private let backupRepository: PortalBackupRepository
 
   @Published var showRecoverChoiceSheet: Bool = false
-  @Published var selectedRecoverMethod: BackupMethods?
+  @Published var selectedRecoverMethod: RainPortalBackupMethod?
   @Published var recoverPassword: String = ""
   @Published var recoverError: Error?
   @Published var isRecovering: Bool = false
@@ -24,7 +23,7 @@ class RecoverViewModel: ObservableObject {
 
   func showRecoverSheet() {
     recoverError = nil
-    selectedRecoverMethod = .Password
+    selectedRecoverMethod = .password
     recoverPassword = ""
     showRecoverChoiceSheet = true
   }
@@ -36,19 +35,19 @@ class RecoverViewModel: ObservableObject {
     recoverError = nil
   }
 
-  func selectRecoverMethod(_ method: BackupMethods) {
+  func selectRecoverMethod(_ method: RainPortalBackupMethod) {
     selectedRecoverMethod = method
     recoverError = nil
   }
 
   func performRecover() async {
     guard let method = selectedRecoverMethod else { return }
-    
-    if method == .Password && recoverPassword.isEmpty {
+
+    if method == .password && recoverPassword.isEmpty {
       recoverError = NSError(domain: "Recover", code: -1, userInfo: [NSLocalizedDescriptionKey: "Password is required."])
       return
     }
-    
+
     guard let token = AuthTokenStorage.getToken(), !token.isEmpty else {
       recoverError = NSError(
         domain: "Recover",
@@ -57,18 +56,18 @@ class RecoverViewModel: ObservableObject {
       )
       return
     }
-    
+
     isRecovering = true
     recoverError = nil
-    
+
     do {
       let backup = try await backupRepository.fetchBackup(backupMethod: method.rawValue)
       try await sdkService.recover(
-        backupMethod: method,
-        password: method == .Password ? recoverPassword : nil,
+        method: method,
+        password: method == .password ? recoverPassword : nil,
         cipherText: backup.cipherText
       )
-      
+
       dismissRecoverSheet()
     } catch {
       recoverError = error

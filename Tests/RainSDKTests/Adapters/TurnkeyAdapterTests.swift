@@ -19,14 +19,6 @@ struct TurnkeyAdapterTests {
     #expect(address == MockTurnkey.defaultWalletAddress)
   }
 
-  @Test("getWalletAddress prefers explicit walletAddress override")
-  func testGetWalletAddressOverride() async throws {
-    let override = "0xover0000000000000000000000000000000000000"
-    let (manager, _, _) = TestManagers.turnkeyManager(walletAddress: override)
-    let address = try await manager.getWalletAddress()
-    #expect(address == override)
-  }
-
   @Test("getWalletAddress refreshes wallets when no eth account is present")
   func testGetWalletAddressRefreshes() async throws {
     let mockTurnkey = MockTurnkey(wallets: [])

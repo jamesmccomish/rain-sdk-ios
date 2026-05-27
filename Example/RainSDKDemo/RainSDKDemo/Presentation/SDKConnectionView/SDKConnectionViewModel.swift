@@ -2,7 +2,6 @@ import Foundation
 import RainSDK
 import Combine
 import AuthenticationServices
-import TurnkeySwift
 
 /// Wallet provider option when not in wallet-agnostic mode.
 enum WalletProviderOption: String, CaseIterable {
@@ -59,16 +58,6 @@ class SDKConnectionViewModel: ObservableObject {
 
   /// True while a passkey authentication request is in flight.
   @Published var isAuthenticatingTurnkey: Bool = false
-
-  /// One-time Turnkey configuration. `TurnkeyContext.configure(...)` must be called before
-  /// the first `.shared` access; we defer it until the user taps a passkey button so the
-  /// user has a chance to enter org id / rpId / etc. first.
-  private static var turnkeyConfigured = false
-
-  /// Snapshot of the values passed to `TurnkeyContext.configure(...)`. Used to detect
-  /// when the user has edited org/rpId/etc. after configure was called — in that case
-  /// we surface a clear error rather than silently using the stale config.
-  private static var configuredSnapshot: (orgId: String, apiUrl: String, authProxyUrl: String, authProxyConfigId: String?, rpId: String)?
 
   // MARK: - Computed Properties
 
@@ -164,74 +153,54 @@ class SDKConnectionViewModel: ObservableObject {
     isInitializing = false
   }
 
-  /// Reset the SDK state. Does not unset `turnkeyConfigured` because
-  /// `TurnkeyContext.configure(...)` is one-shot for the process lifetime; the next
-  /// passkey attempt will detect config drift and tell the user to relaunch.
+  /// Reset the SDK state. Note: `initializeTurnkey` runs `TurnkeyContext.configure(...)`
+  /// internally, which is one-shot per process — editing org/rpId/etc. and retrying will
+  /// surface an `internalLogicError` until the app is relaunched.
   func resetSDK() {
     sdkService.reset()
   }
 
   // MARK: - Turnkey Passkey
 
-  /// Sign in to Turnkey with an existing passkey, then initialize Rain.
+  /// Sign in to Turnkey with an existing passkey via Rain's facade.
   func loginWithTurnkeyPasskey(anchor: ASPresentationAnchor) async {
-    guard let chainIdInt = Int(chainId), canAuthenticateWithPasskey else { return }
-
-    persistTurnkeyConfig()
-    isAuthenticatingTurnkey = true
-    sdkService.statusMessage = "Authenticating with passkey..."
-    sdkService.error = nil
-
-    do {
-      try configureTurnkeyIfNeeded()
-      let context = TurnkeyContext.shared
-      // Clear any leftover session from a previous login so the next call
-      // doesn't fail with `keyAlreadyExists` on the default session key.
-      // Clear by default key — `clearSession()` no-args is a no-op on fresh launch
-      // (selectedSessionKey is nil while the Keychain still holds a prior JWT).
-      context.clearSession(for: TurnkeySwift.Constants.Session.defaultSessionKey)
-      _ = try await context.loginWithPasskey(anchor: anchor)
-
-      await sdkService.initializeTurnkey(
-        turnkey: context,
-        networkConfigs: makeNetworkConfigs(chainIdInt: chainIdInt)
-      )
-    } catch {
-      sdkService.error = .providerError(underlying: error)
-      sdkService.statusMessage = "Turnkey passkey login failed"
+    guard canAuthenticateWithPasskey else { return }
+    await runTurnkeyPasskeyFlow(anchor: anchor, statusMessage: "Authenticating with passkey...") { service, anchor in
+      await service.loginWithPasskey(anchor: anchor)
     }
-
-    isAuthenticatingTurnkey = false
   }
 
-  /// Create a fresh Turnkey sub-org (with a wallet, per the auth proxy's defaults) and
-  /// register a passkey for it on the device. Then initialize Rain.
+  /// Create a fresh Turnkey sub-org and register a passkey for it on the device.
   func signUpWithTurnkeyPasskey(anchor: ASPresentationAnchor) async {
-    guard let chainIdInt = Int(chainId), canSignUpWithPasskey else { return }
+    guard canSignUpWithPasskey else { return }
+    await runTurnkeyPasskeyFlow(anchor: anchor, statusMessage: "Registering passkey...") { service, anchor in
+      await service.signUpWithPasskey(anchor: anchor)
+    }
+  }
+
+  private func runTurnkeyPasskeyFlow(
+    anchor: ASPresentationAnchor,
+    statusMessage: String,
+    action: (RainSDKService, ASPresentationAnchor) async -> Void
+  ) async {
+    guard let chainIdInt = Int(chainId) else { return }
+    guard let config = makeRainTurnkeyConfig() else {
+      sdkService.error = .internalLogicError(details: "Missing Turnkey configuration.")
+      return
+    }
 
     persistTurnkeyConfig()
     isAuthenticatingTurnkey = true
-    sdkService.statusMessage = "Registering passkey..."
+    sdkService.statusMessage = statusMessage
     sdkService.error = nil
 
-    do {
-      try configureTurnkeyIfNeeded()
-      let context = TurnkeyContext.shared
-      // Clear by default key — `clearSession()` no-args is a no-op on fresh launch
-      // (selectedSessionKey is nil while the Keychain still holds a prior JWT).
-      context.clearSession(for: TurnkeySwift.Constants.Session.defaultSessionKey)
-      _ = try await context.signUpWithPasskey(
-        anchor: anchor,
-        createSubOrgParams: try makeEthereumWalletSubOrgParams()
-      )
+    await sdkService.initializeTurnkey(
+      config: config,
+      networkConfigs: makeNetworkConfigs(chainIdInt: chainIdInt)
+    )
 
-      await sdkService.initializeTurnkey(
-        turnkey: context,
-        networkConfigs: makeNetworkConfigs(chainIdInt: chainIdInt)
-      )
-    } catch {
-      sdkService.error = .providerError(underlying: error)
-      sdkService.statusMessage = "Turnkey passkey signup failed"
+    if sdkService.error == nil {
+      await action(sdkService, anchor)
     }
 
     isAuthenticatingTurnkey = false
@@ -239,7 +208,7 @@ class SDKConnectionViewModel: ObservableObject {
 
   // MARK: - Turnkey Configuration
 
-  private func configureTurnkeyIfNeeded() throws {
+  private func makeRainTurnkeyConfig() -> RainTurnkeyConfig? {
     let orgId = turnkeyOrgId.trimmingCharacters(in: .whitespacesAndNewlines)
     let apiUrl = turnkeyApiUrl.trimmingCharacters(in: .whitespacesAndNewlines)
     let authProxyUrl = turnkeyAuthProxyUrl.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -247,43 +216,19 @@ class SDKConnectionViewModel: ObservableObject {
     let rpId = turnkeyRpId.trimmingCharacters(in: .whitespacesAndNewlines)
 
     guard !orgId.isEmpty, !apiUrl.isEmpty, !authProxyUrl.isEmpty, !rpId.isEmpty else {
-      throw NSError(
-        domain: "RainSDKDemo.Turnkey", code: -2,
-        userInfo: [NSLocalizedDescriptionKey: "Missing Turnkey configuration."])
+      return nil
     }
 
-    let snapshot = (
-      orgId: orgId,
+    let authProxy = authProxyConfigId.isEmpty
+      ? nil
+      : RainTurnkeyConfig.AuthProxy(url: authProxyUrl, configId: authProxyConfigId)
+
+    return RainTurnkeyConfig(
+      organizationId: orgId,
       apiUrl: apiUrl,
-      authProxyUrl: authProxyUrl,
-      authProxyConfigId: authProxyConfigId.isEmpty ? nil : authProxyConfigId,
-      rpId: rpId
+      authProxy: authProxy,
+      passkey: .init(rpId: rpId)
     )
-
-    if Self.turnkeyConfigured {
-      // `TurnkeyContext.configure(...)` is one-shot for the process lifetime. If the
-      // user edits a config field after the first configure, fail loudly instead of
-      // silently using stale values.
-      if let existing = Self.configuredSnapshot, existing != snapshot {
-        throw NSError(
-          domain: "RainSDKDemo.Turnkey", code: -4,
-          userInfo: [NSLocalizedDescriptionKey:
-            "Turnkey is already configured with different values this session. Fully kill the app and relaunch to apply changes to Organization ID, API URL, Auth Proxy URL, Auth Proxy Config ID, or rpId."])
-      }
-      return
-    }
-
-    TurnkeyContext.configure(
-      TurnkeyConfig(
-        organizationId: orgId,
-        apiUrl: apiUrl,
-        authProxyUrl: authProxyUrl,
-        authProxyConfigId: snapshot.authProxyConfigId,
-        rpId: rpId
-      )
-    )
-    Self.turnkeyConfigured = true
-    Self.configuredSnapshot = snapshot
   }
 
   private func persistTurnkeyConfig() {
@@ -292,36 +237,6 @@ class SDKConnectionViewModel: ObservableObject {
     TurnkeyConfigStorage.authProxyUrl = turnkeyAuthProxyUrl
     TurnkeyConfigStorage.authProxyConfigId = turnkeyAuthProxyConfigId
     TurnkeyConfigStorage.rpId = turnkeyRpId
-  }
-
-  /// Build `CreateSubOrgParams` carrying a default Ethereum wallet so the new sub-org
-  /// always has a wallet whose first account uses `ADDRESS_FORMAT_ETHEREUM` (which is
-  /// what Rain's Turnkey adapter resolves to). `CreateSubOrgParams` has no public init,
-  /// so we go through `JSONDecoder`. Brittle: if TurnkeySwift changes the field names
-  /// or shape of `CreateSubOrgParams`, this fails at runtime during sign-up rather
-  /// than at compile time. Revisit if/when TurnkeySwift exposes a public initializer.
-  private func makeEthereumWalletSubOrgParams() throws -> CreateSubOrgParams {
-    let json = """
-    {
-      "customWallet": {
-        "walletName": "Rain Demo Wallet",
-        "accounts": [
-          {
-            "addressFormat": "ADDRESS_FORMAT_ETHEREUM",
-            "curve": "CURVE_SECP256K1",
-            "path": "m/44'/60'/0'/0/0",
-            "pathFormat": "PATH_FORMAT_BIP32"
-          }
-        ]
-      }
-    }
-    """
-    guard let data = json.data(using: .utf8) else {
-      throw NSError(
-        domain: "RainSDKDemo.Turnkey", code: -3,
-        userInfo: [NSLocalizedDescriptionKey: "Failed to encode wallet params."])
-    }
-    return try JSONDecoder().decode(CreateSubOrgParams.self, from: data)
   }
 
   private func makeNetworkConfigs(chainIdInt: Int) -> [NetworkConfig] {

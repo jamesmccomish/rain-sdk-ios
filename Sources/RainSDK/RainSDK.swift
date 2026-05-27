@@ -1,17 +1,10 @@
 import Foundation
 import CoreGraphics
-import PortalSwift
-import TurnkeySwift
+import PortalSwift // for ETHTransactionParam on composeTransactionParameters (TODO make more general)
 import Web3
 
 // Declaration of wallet provider instances and initialization methods
 public protocol RainSDK {
-  /// The initialized Portal instance
-  var portal: Portal { get throws }
-
-  /// The initialized Turnkey context
-  var turnkey: TurnkeyContext { get throws }
-  
   /// Initializes the SDK with a Portal token and network configurations
   /// - Parameters:
   ///   - portalSessionToken: A valid Portal session token
@@ -24,20 +17,19 @@ public protocol RainSDK {
     networkConfigs: [NetworkConfig]
   ) async throws
 
-  /// Initializes the SDK with an authenticated Turnkey context and network configurations.
-  /// Use the official Turnkey Swift SDK for auth flows such as passkeys / auth proxy, then pass
-  /// the live context into Rain for wallet operations.
+  /// Initializes Turnkey-backed authentication. The wallet provider is bound automatically
+  /// once a session becomes active; observe `authState` for transitions.
+  ///
+  /// `TurnkeyContext.configure(_:)` is single-shot per process. Calling this twice with the
+  /// same `config` is a no-op; calling with a different `config` throws.
   ///
   /// - Parameters:
-  ///   - turnkey: An authenticated `TurnkeyContext`.
+  ///   - config: Turnkey bootstrap config (org id, API URL, passkey rpId, optional Auth Proxy, OAuth).
   ///   - networkConfigs: Array of network configurations, each containing chain ID and RPC URL.
-  ///   - walletAddress: Optional explicit EVM wallet address to use. When omitted, Rain uses the
-  ///                    first available Ethereum account from the Turnkey context.
-  /// - Throws: `RainSDKError` if initialization fails or no usable EVM wallet is available.
+  /// - Throws: `RainSDKError` if validation fails or the process has already been configured with a different Turnkey config.
   func initializeTurnkey(
-    turnkey: TurnkeyContext,
-    networkConfigs: [NetworkConfig],
-    walletAddress: String?
+    config: RainTurnkeyConfig,
+    networkConfigs: [NetworkConfig]
   ) async throws
   
   /// Initializes the SDK with network configurations only (wallet-agnostic mode)

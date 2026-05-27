@@ -87,22 +87,19 @@ struct SDKInitializationTests {
 
   // MARK: - Provider access before init
 
-  @Test("portal access before initialization throws sdkNotInitialized")
-  func testPortalAccessBeforeInitialization() throws {
+  @Test("recoverPortalWallet before initialization throws sdkNotInitialized")
+  func testRecoverPortalBeforeInitialization() async throws {
     let manager = RainSDKManager()
 
-    #expect(throws: RainSDKError.sdkNotInitialized) {
-      try manager.portal
+    await #expect(throws: RainSDKError.sdkNotInitialized) {
+      try await manager.recoverPortalWallet(method: .iCloud, cipherText: "anything")
     }
   }
 
-  @Test("turnkey access before initialization throws sdkNotInitialized")
-  func testTurnkeyAccessBeforeInitialization() throws {
+  @Test("currentAuthState is unauthenticated before initialization")
+  func testAuthStateBeforeInitialization() {
     let manager = RainSDKManager()
-
-    #expect(throws: RainSDKError.sdkNotInitialized) {
-      try manager.turnkey
-    }
+    #expect(manager.currentAuthState == .unauthenticated)
   }
 
   // MARK: - Validation helpers
@@ -231,14 +228,14 @@ struct SDKInitializationTests {
     }
   }
 
-  @Test("portal access after wallet-agnostic initialize throws sdkNotInitialized")
-  func testPortalAccessAfterWalletAgnosticInit() async throws {
+  @Test("recoverPortalWallet after wallet-agnostic initialize throws sdkNotInitialized")
+  func testRecoverPortalAfterWalletAgnosticInit() async throws {
     let manager = RainSDKManager()
     let configs = [NetworkConfig.testConfig(chainId: 1)]
     try await manager.initialize(networkConfigs: configs)
 
-    #expect(throws: RainSDKError.sdkNotInitialized) {
-      try manager.portal
+    await #expect(throws: RainSDKError.sdkNotInitialized) {
+      try await manager.recoverPortalWallet(method: .iCloud, cipherText: "anything")
     }
   }
 

@@ -1,3 +1,5 @@
+import AuthenticationServices
+import Combine
 import Foundation
 @testable import RainSDK
 import TurnkeySwift
@@ -159,14 +161,48 @@ final class MockTurnkey: TurnkeyContextProtocol {
   /// Error to throw from `signRawPayload`. When set, the mock fails before producing a signature.
   var signRawPayloadError: Error?
 
+  // Auth state — drives the manager's wallet-provider binding when injected for facade tests.
+  private let authStateSubject: CurrentValueSubject<AuthState, Never>
+  var authState: AuthState { authStateSubject.value }
+  var authStatePublisher: AnyPublisher<AuthState, Never> {
+    authStateSubject.eraseToAnyPublisher()
+  }
+
+  /// Test hook: drive `authState` transitions to simulate login / sign-out.
+  func setAuthState(_ state: AuthState) {
+    authStateSubject.send(state)
+  }
+
+  // Auth method spies — set the corresponding error to make the call throw.
+  var loginWithPasskeyError: Error?
+  var signUpWithPasskeyError: Error?
+  var initOtpError: Error?
+  var completeOtpError: Error?
+  var oauthError: Error?
+
+  var loginWithPasskeyCallCount = 0
+  var signUpWithPasskeyCallCount = 0
+  var initOtpCalls: [(contact: String, otpType: OtpType)] = []
+  var completeOtpCalls: [(otpId: String, otpCode: String, contact: String)] = []
+  var oauthProviderCalls: [String] = []
+  var clearSessionCallCount = 0
+
+  /// Optional canned result returned from `initOtp`.
+  var initOtpResult: InitOtpResult = MockTurnkey.decode(
+    InitOtpResultFixture(otpId: "otp-id", otpEncryptionTargetBundle: "bundle"),
+    as: InitOtpResult.self
+  )
+
   init(
     wallets: [Wallet] = [MockTurnkey.defaultWallet()],
     session: Session? = MockTurnkey.defaultSession(),
-    client: (any TurnkeyClientProtocol)? = MockTurnkeyClient()
+    client: (any TurnkeyClientProtocol)? = MockTurnkeyClient(),
+    authState: AuthState = .authenticated
   ) {
     self.wallets = wallets
     self.session = session
     self.turnkeyClient = client
+    self.authStateSubject = CurrentValueSubject(authState)
   }
 
   func refreshWallets() async throws {
@@ -194,6 +230,78 @@ final class MockTurnkey: TurnkeyContextProtocol {
 
     return mockSignature
   }
+
+  func loginWithPasskey(
+    anchor: ASPresentationAnchor,
+    expirationSeconds: String?
+  ) async throws -> PasskeyAuthResult {
+    loginWithPasskeyCallCount += 1
+    if let loginWithPasskeyError { throw loginWithPasskeyError }
+    setAuthState(.authenticated)
+    return MockTurnkey.makePasskeyAuthResult()
+  }
+
+  func signUpWithPasskey(
+    anchor: ASPresentationAnchor,
+    passkeyDisplayName: String?,
+    expirationSeconds: String?
+  ) async throws -> PasskeyAuthResult {
+    signUpWithPasskeyCallCount += 1
+    if let signUpWithPasskeyError { throw signUpWithPasskeyError }
+    setAuthState(.authenticated)
+    return MockTurnkey.makePasskeyAuthResult()
+  }
+
+  func initOtp(contact: String, otpType: OtpType) async throws -> InitOtpResult {
+    initOtpCalls.append((contact, otpType))
+    if let initOtpError { throw initOtpError }
+    return initOtpResult
+  }
+
+  func completeOtp(
+    otpId: String,
+    otpCode: String,
+    otpEncryptionTargetBundle: String,
+    contact: String,
+    otpType: OtpType
+  ) async throws -> CompleteOtpResult {
+    completeOtpCalls.append((otpId, otpCode, contact))
+    if let completeOtpError { throw completeOtpError }
+    setAuthState(.authenticated)
+    return MockTurnkey.decode(
+      CompleteOtpResultFixture(session: "jwt", verificationToken: "vt", action: "login"),
+      as: CompleteOtpResult.self
+    )
+  }
+
+  func handleGoogleOAuth(anchor: ASPresentationAnchor) async throws {
+    oauthProviderCalls.append("google")
+    if let oauthError { throw oauthError }
+    setAuthState(.authenticated)
+  }
+
+  func handleAppleOAuth() async throws {
+    oauthProviderCalls.append("apple")
+    if let oauthError { throw oauthError }
+    setAuthState(.authenticated)
+  }
+
+  func handleDiscordOAuth(anchor: ASPresentationAnchor) async throws {
+    oauthProviderCalls.append("discord")
+    if let oauthError { throw oauthError }
+    setAuthState(.authenticated)
+  }
+
+  func handleXOauth(anchor: ASPresentationAnchor) async throws {
+    oauthProviderCalls.append("x")
+    if let oauthError { throw oauthError }
+    setAuthState(.authenticated)
+  }
+
+  func clearSession(for sessionKey: String?) {
+    clearSessionCallCount += 1
+    setAuthState(.unAuthenticated)
+  }
 }
 
 extension MockTurnkey {
@@ -212,32 +320,46 @@ extension MockTurnkey {
   }
 
   static func defaultWallet() -> Wallet {
+    wallet(
+      walletId: "wallet-id",
+      walletName: "wallet",
+      accounts: [defaultEthAccount()]
+    )
+  }
+
+  static func wallet(walletId: String, walletName: String, accounts: [WalletAccount]) -> Wallet {
     decode(
       WalletFixture(
-        walletId: "wallet-id",
-        walletName: "wallet",
+        walletId: walletId,
+        walletName: walletName,
         createdAt: "0",
         updatedAt: "0",
         exported: false,
         imported: false,
-        accounts: [
-          WalletAccount(
-            address: defaultWalletAddress,
-            addressFormat: .address_format_ethereum,
-            createdAt: externaldatav1Timestamp(nanos: "0", seconds: "0"),
-            curve: .curve_secp256k1,
-            organizationId: "org-id",
-            path: "m/44'/60'/0'/0/0",
-            pathFormat: .path_format_bip32,
-            publicKey: nil,
-            updatedAt: externaldatav1Timestamp(nanos: "0", seconds: "0"),
-            walletAccountId: "wallet-account-id",
-            walletDetails: nil,
-            walletId: "wallet-id"
-          )
-        ]
+        accounts: accounts
       ),
       as: Wallet.self
+    )
+  }
+
+  static func defaultEthAccount() -> WalletAccount {
+    ethAccount(address: defaultWalletAddress, walletAccountId: "wallet-account-id")
+  }
+
+  static func ethAccount(address: String, walletAccountId: String) -> WalletAccount {
+    WalletAccount(
+      address: address,
+      addressFormat: .address_format_ethereum,
+      createdAt: externaldatav1Timestamp(nanos: "0", seconds: "0"),
+      curve: .curve_secp256k1,
+      organizationId: "org-id",
+      path: "m/44'/60'/0'/0/0",
+      pathFormat: .path_format_bip32,
+      publicKey: nil,
+      updatedAt: externaldatav1Timestamp(nanos: "0", seconds: "0"),
+      walletAccountId: walletAccountId,
+      walletDetails: nil,
+      walletId: "wallet-id"
     )
   }
 
@@ -340,4 +462,29 @@ private struct WalletFixture: Encodable {
   let exported: Bool
   let imported: Bool
   let accounts: [v1WalletAccount]
+}
+
+private struct InitOtpResultFixture: Encodable {
+  let otpId: String
+  let otpEncryptionTargetBundle: String
+}
+
+private struct CompleteOtpResultFixture: Encodable {
+  let session: String
+  let verificationToken: String
+  let action: String
+}
+
+private struct PasskeyAuthResultFixture: Encodable {
+  let session: String
+  let credentialId: String
+}
+
+extension MockTurnkey {
+  static func makePasskeyAuthResult(session: String = "jwt", credentialId: String = "cred") -> PasskeyAuthResult {
+    decode(
+      PasskeyAuthResultFixture(session: session, credentialId: credentialId),
+      as: PasskeyAuthResult.self
+    )
+  }
 }

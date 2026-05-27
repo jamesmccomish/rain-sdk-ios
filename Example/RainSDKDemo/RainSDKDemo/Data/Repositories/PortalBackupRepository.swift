@@ -1,5 +1,4 @@
 import Foundation
-import PortalSwift
 
 /// Repository for GET /v1/portal/backup. Fetches backup (cipher text) before Portal recover.
 final class PortalBackupRepository {

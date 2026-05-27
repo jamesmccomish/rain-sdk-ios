@@ -27,32 +27,32 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
   private let turnkey: TurnkeyContextProtocol
   private let transactionBuilder: TransactionBuilderProtocol?
   private let networkConfigsByChainId: [Int: NetworkConfig]
-  private let walletAddressOverride: String?
+  /// Returns the host-selected wallet address, if any. Resolved lazily on each `address()`
+  /// call so updates from `selectWallet(...)` apply to the next operation immediately.
+  private let selectedAddressProvider: () -> String?
 
   internal init(
     turnkey: TurnkeyContextProtocol,
     transactionBuilder: TransactionBuilderProtocol? = nil,
     networkConfigs: [NetworkConfig],
-    walletAddress: String? = nil
+    selectedAddressProvider: @escaping () -> String? = { nil }
   ) {
     self.turnkey = turnkey
     self.transactionBuilder = transactionBuilder
     self.networkConfigsByChainId = Dictionary(uniqueKeysWithValues: networkConfigs.map { ($0.chainId, $0) })
-    self.walletAddressOverride = walletAddress
+    self.selectedAddressProvider = selectedAddressProvider
   }
 
   public func address() async throws -> String {
-    if let walletAddressOverride, !walletAddressOverride.isEmpty {
-      return walletAddressOverride
-    }
+    let selected = selectedAddressProvider()
 
-    if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets) {
+    if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets, preferred: selected) {
       return walletAddress
     }
 
     try await turnkey.refreshWallets()
 
-    if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets) {
+    if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets, preferred: selected) {
       return walletAddress
     }
 
@@ -350,11 +350,17 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
     )
   }
 
-  private func resolveEthereumWalletAddress(from wallets: [Wallet]) -> String? {
-    wallets
+  private func resolveEthereumWalletAddress(from wallets: [Wallet], preferred: String?) -> String? {
+    let ethAccounts = wallets
       .flatMap(\.accounts)
-      .first(where: { $0.addressFormat == .address_format_ethereum })?
-      .address
+      .filter { $0.addressFormat == .address_format_ethereum }
+
+    if let preferred,
+       let match = ethAccounts.first(where: { $0.address.lowercased() == preferred.lowercased() }) {
+      return match.address
+    }
+
+    return ethAccounts.first?.address
   }
 
   private func draftTransaction(

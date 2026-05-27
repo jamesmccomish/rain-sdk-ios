@@ -66,16 +66,14 @@ enum TestManagers {
   static func turnkeyManager(
     turnkey: MockTurnkey? = nil,
     builder: MockTransactionBuilderService? = nil,
-    configs: [NetworkConfig] = TestFixtures.configs(),
-    walletAddress: String? = nil
+    configs: [NetworkConfig] = TestFixtures.configs()
   ) -> (RainSDKManager, MockTurnkey, MockTransactionBuilderService) {
     let resolvedTurnkey = turnkey ?? MockTurnkey()
     let resolvedBuilder = builder ?? MockTransactionBuilderService(networkConfigs: configs)
     let manager = RainSDKManager(
       turnkey: resolvedTurnkey,
       transactionBuilder: resolvedBuilder,
-      networkConfigs: configs,
-      walletAddress: walletAddress
+      networkConfigs: configs
     )
     return (manager, resolvedTurnkey, resolvedBuilder)
   }

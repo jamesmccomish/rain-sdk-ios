@@ -1,11 +1,11 @@
 import SwiftUI
-import PortalSwift
+import RainSDK
 
 /// Alert-style popup: choose iCloud or password to recover wallet. Shown for Portal on Transfer and Collateral Withdraw entry.
 struct RecoverChoiceView: View {
   @ObservedObject var viewModel: RecoverViewModel
 
-  private static let recoverOptions: [BackupMethods] = [.iCloud, .Password]
+  private static let recoverOptions: [RainPortalBackupMethod] = [.iCloud, .password]
 
   var body: some View {
     VStack(spacing: 20) {
@@ -33,7 +33,7 @@ struct RecoverChoiceView: View {
         .pickerStyle(.menu)
       }
 
-      if viewModel.selectedRecoverMethod == .Password {
+      if viewModel.selectedRecoverMethod == .password {
         VStack(alignment: .leading, spacing: 8) {
           Text("Password")
             .font(.subheadline)
@@ -82,7 +82,7 @@ struct RecoverChoiceView: View {
         .buttonStyle(.borderedProminent)
         .disabled(
           viewModel.isRecovering
-          || (viewModel.selectedRecoverMethod == .Password && viewModel.recoverPassword.isEmpty)
+          || (viewModel.selectedRecoverMethod == .password && viewModel.recoverPassword.isEmpty)
         )
       }
     }
@@ -93,10 +93,10 @@ struct RecoverChoiceView: View {
     .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 10)
   }
 
-  private func methodDisplayName(_ method: BackupMethods) -> String {
+  private func methodDisplayName(_ method: RainPortalBackupMethod) -> String {
     switch method {
     case .iCloud: return "iCloud"
-    case .Password: return "Password"
+    case .password: return "Password"
     default: return "\(method)"
     }
   }

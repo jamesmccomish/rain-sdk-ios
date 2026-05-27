@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import CoreGraphics
 import PortalSwift
@@ -11,59 +12,53 @@ import Web3ContractABI
 public final class RainSDKManager: RainSDK {
   // MARK: - Properties
 
-  // Internal storage for Portal instance (using protocol for testability)
-  private var _portal: PortalRequestProtocol?
-  private var _turnkey: TurnkeyContextProtocol?
+  // Provider storage. Typed as protocols so tests can inject mocks.
+  internal var _portal: PortalRequestProtocol?
+  internal var _turnkey: TurnkeyContextProtocol?
+
+  /// Guards the mutable state below (`_walletProvider`, `_selectedWalletAddress`). Auth-state
+  /// transitions arrive on the main queue while wallet methods may read from any executor —
+  /// the lock provides happens-before between the writer and the reader.
+  private let _stateLock = NSLock()
+  private var __walletProvider: (any RainWalletProvider)?
+  private var __selectedWalletAddress: String?
 
   /// Wallet provider for address, balance, signing, and submission.
   /// Set when `initializePortal` or `initializeTurnkey` is used; nil in wallet-agnostic mode.
-  var _walletProvider: (any RainWalletProvider)?
-  
-  // Transaction builder service
+  internal var _walletProvider: (any RainWalletProvider)? {
+    get { _stateLock.lock(); defer { _stateLock.unlock() }; return __walletProvider }
+    set { _stateLock.lock(); defer { _stateLock.unlock() }; __walletProvider = newValue }
+  }
+
   private var _transactionBuilder: TransactionBuilderProtocol?
-  
+
   private var _networkConfigs: [NetworkConfig] = []
-  
-  /// Computed property to safely access the Portal instance
-  /// Returns Portal (concrete type) for public API compatibility
-  /// 
-  /// - Note: This property can only be accessed when a real Portal instance is initialized.
-  ///         When using mocks (e.g., MockPortal) for testing, this property will throw an error.
-  ///         Use `portalProtocol` property for testing with mocks.
-  public var portal: Portal {
-    get throws {
-      guard let portalProtocol = _portal
-      else {
-        throw RainSDKError.sdkNotInitialized
-      }
-      
-      // Cast to Portal for public API
-      guard let portal = portalProtocol as? Portal
-      else {
-        throw RainSDKError.sdkNotInitialized
-      }
-      
-      return portal
-    }
+
+  /// Subject mirroring the Turnkey auth state; published to host via `authState`.
+  internal let _authStateSubject = CurrentValueSubject<RainAuthState, Never>(.unauthenticated)
+  internal var _authStateCancellable: AnyCancellable?
+
+  /// Host-selected wallet address (lowercased on read). `nil` falls back to the first
+  /// Ethereum account in the Turnkey context.
+  internal var _selectedWalletAddress: String? {
+    get { _stateLock.lock(); defer { _stateLock.unlock() }; return __selectedWalletAddress }
+    set { _stateLock.lock(); defer { _stateLock.unlock() }; __selectedWalletAddress = newValue }
   }
 
-  /// Computed property to safely access the Turnkey context
+  /// Snapshot of the Turnkey config used the first time `initializeTurnkey` ran in this process.
+  /// `TurnkeyContext.configure(_:)` can only be called once, so a second call with a different
+  /// config throws.
   ///
-  /// - Note: This property can only be accessed when a real `TurnkeyContext` is initialized.
-  ///         When using mocks for testing, this property will throw an error.
-  public var turnkey: TurnkeyContext {
-    get throws {
-      guard let turnkeyProtocol = _turnkey else {
-        throw RainSDKError.sdkNotInitialized
-      }
+  /// Invariant: all reads and writes must hold `_configureLock`. `nonisolated(unsafe)` suppresses
+  /// Swift's concurrency checking, so any future access outside the lock would be a silent race.
+  nonisolated(unsafe) private static var _configuredTurnkeySnapshot: RainTurnkeyConfig?
+  private static let _configureLock = NSLock()
 
-      guard let turnkey = turnkeyProtocol as? TurnkeyContext else {
-        throw RainSDKError.sdkNotInitialized
-      }
-
-      return turnkey
-    }
-  }
+  /// Fallback Auth Proxy URL used when `RainTurnkeyConfig.authProxy` is `nil`. TurnkeySwift's
+  /// `TurnkeyConfig.authProxyUrl` is non-optional, so passkey-only deployments still receive a
+  /// concrete URL. Auth Proxy calls only happen for OTP / OAuth flows, so this URL is unused
+  /// when the host stays on the passkey path.
+  private static let defaultAuthProxyUrl = "https://authproxy.turnkey.com"
   
   /// Internal property for testing - returns PortalRequestProtocol which works with both Portal and MockPortal
   /// Use this property in tests when working with mocks
@@ -115,8 +110,7 @@ public final class RainSDKManager: RainSDK {
   internal init(
     turnkey: TurnkeyContextProtocol?,
     transactionBuilder: TransactionBuilderProtocol?,
-    networkConfigs: [NetworkConfig] = [],
-    walletAddress: String? = nil
+    networkConfigs: [NetworkConfig] = []
   ) {
     self._portal = nil
     self._turnkey = turnkey
@@ -126,8 +120,7 @@ public final class RainSDKManager: RainSDK {
       TurnkeyWalletProviderAdapter(
         turnkey: $0,
         transactionBuilder: transactionBuilder,
-        networkConfigs: networkConfigs,
-        walletAddress: walletAddress
+        networkConfigs: networkConfigs
       )
     }
   }
@@ -177,35 +170,74 @@ public final class RainSDKManager: RainSDK {
     }
   }
 
+  /// Bootstraps Turnkey-backed authentication. The wallet provider is bound automatically
+  /// once a session becomes active (either restored from the Keychain or via a fresh login);
+  /// observe `authState` to drive UI.
+  ///
+  /// `TurnkeyContext.configure(_:)` is single-shot per process. Calling this twice with the
+  /// same `config` is a no-op; calling with a different `config` throws.
   public func initializeTurnkey(
-    turnkey: TurnkeyContext,
-    networkConfigs: [NetworkConfig],
-    walletAddress: String? = nil
+    config: RainTurnkeyConfig,
+    networkConfigs: [NetworkConfig]
   ) async throws {
     try validateNetworkConfigs(networkConfigs)
 
+    try Self.configureTurnkeyContextOnce(with: config)
+    let context = TurnkeyContext.shared
+
     let transactionBuilder = TransactionBuilderService(networkConfigs: networkConfigs)
-    let provider = TurnkeyWalletProviderAdapter(
-      turnkey: turnkey,
+
+    _networkConfigs = networkConfigs
+    _portal = nil
+    _turnkey = context
+    _transactionBuilder = transactionBuilder
+    _walletProvider = nil
+
+    bindTurnkeyAuthState(
+      context: context,
       transactionBuilder: transactionBuilder,
-      networkConfigs: networkConfigs,
-      walletAddress: walletAddress
+      networkConfigs: networkConfigs
     )
 
-    do {
-      _ = try await provider.address()
+    RainLogger.info("Rain SDK: Registered Turnkey context with \(networkConfigs.count) network(s); awaiting authentication")
+  }
 
-      _networkConfigs = networkConfigs
-      _portal = nil
-      _turnkey = turnkey
-      _transactionBuilder = transactionBuilder
-      _walletProvider = provider
+  private static func configureTurnkeyContextOnce(with config: RainTurnkeyConfig) throws {
+    _configureLock.lock()
+    defer { _configureLock.unlock() }
 
-      RainLogger.info("Rain SDK: Registered Turnkey context successfully with \(networkConfigs.count) network(s)")
-    } catch {
-      RainLogger.error("Rain SDK: Turnkey initialization error - \(error.localizedDescription)")
-      throw RainSDKError.from(underlying: error)
+    if let existing = _configuredTurnkeySnapshot {
+      guard existing == config else {
+        throw RainSDKError.internalLogicError(
+          details: "TurnkeyContext was already configured with a different config; restart the app to change Turnkey settings."
+        )
+      }
+      return
     }
+
+    let tkConfig = TurnkeyConfig(
+      organizationId: config.organizationId,
+      apiUrl: config.apiUrl,
+      authProxyUrl: config.authProxy?.url ?? defaultAuthProxyUrl,
+      authProxyConfigId: config.authProxy?.configId,
+      rpId: config.passkey.rpId,
+      auth: TurnkeyConfig.Auth(
+        oauth: config.oauth.map {
+          TurnkeyConfig.Auth.Oauth(redirectUri: nil, appScheme: $0.appScheme, providers: nil)
+        },
+        autoRefreshSession: nil,
+        passkey: PasskeyOptionsPartial(
+          passkeyName: nil,
+          rpId: config.passkey.rpId,
+          rpName: config.passkey.rpName
+        ),
+        createSuborgParams: nil
+      ),
+      autoRefreshManagedState: config.autoRefreshManagedState
+    )
+
+    TurnkeyContext.configure(tkConfig)
+    _configuredTurnkeySnapshot = config
   }
   
   public func initialize(

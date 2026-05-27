@@ -1,11 +1,11 @@
+import AuthenticationServices
+import Combine
 import Foundation
 import UIKit
 import RainSDK
 import Web3
 import Web3Core
 import web3swift
-import PortalSwift
-import TurnkeySwift
 
 /// Service class for managing Rain SDK operations
 @MainActor
@@ -32,9 +32,14 @@ class RainSDKService: ObservableObject {
 
   /// Active provider after the last successful initialize. Used by demo views to gate provider-specific UI (e.g. Portal recover sheet).
   @Published var activeProvider: ActiveProvider = .none
-  
+
+  /// Latest published Rain auth state. Mirrored from `sdkManager.authState` while Turnkey is active.
+  @Published var authState: RainAuthState = .unauthenticated
+
+  private var authStateCancellable: AnyCancellable?
+
   // MARK: - Initialization
-  
+
   private init() {}
   
   /// Current error state
@@ -82,16 +87,9 @@ class RainSDKService: ObservableObject {
     }
   }
 
-  /// Initialize the SDK with an authenticated `TurnkeyContext` and network configurations.
-  /// - Parameters:
-  ///   - turnkey: A `TurnkeyContext` whose `authState == .authenticated`. Auth (passkey, OTP, etc.) is the host app's responsibility.
-  ///   - networkConfigs: Array of network configurations.
-  ///   - walletAddress: Optional override; otherwise the first Ethereum-format account from the Turnkey context is used.
-  func initializeTurnkey(
-    turnkey: TurnkeyContext,
-    networkConfigs: [NetworkConfig],
-    walletAddress: String? = nil
-  ) async {
+  /// Bootstrap Turnkey-backed authentication. Subsequent calls to `loginWithPasskey` /
+  /// `completeOtp` / `loginWithOAuth` activate the wallet provider.
+  func initializeTurnkey(config: RainTurnkeyConfig, networkConfigs: [NetworkConfig]) async {
     statusMessage = "Initializing (Turnkey)..."
     error = nil
 
@@ -99,16 +97,15 @@ class RainSDKService: ObservableObject {
       RainLogger.isEnabled = true
 
       try await sdkManager.initializeTurnkey(
-        turnkey: turnkey,
-        networkConfigs: networkConfigs,
-        walletAddress: walletAddress
+        config: config,
+        networkConfigs: networkConfigs
       )
 
-      print("Rain SDK: wallet address \(try await sdkManager.getWalletAddress())")
+      observeAuthState()
 
       isInitialized = true
       activeProvider = .turnkey
-      statusMessage = "Initialized successfully (Turnkey) with \(networkConfigs.count) network(s)"
+      statusMessage = "Initialized (Turnkey); awaiting authentication"
       error = nil
     } catch let sdkError as RainSDKError {
       isInitialized = false
@@ -121,6 +118,40 @@ class RainSDKService: ObservableObject {
       self.error = RainSDKError.providerError(underlying: error)
       statusMessage = "Initialization failed: Unknown error"
     }
+  }
+
+  /// Log in (or sign up) with a passkey. Requires `initializeTurnkey` to have been called.
+  func loginWithPasskey(anchor: ASPresentationAnchor) async {
+    do {
+      try await sdkManager.loginWithPasskey(anchor: anchor)
+    } catch let sdkError as RainSDKError {
+      error = sdkError
+    } catch {
+      self.error = RainSDKError.providerError(underlying: error)
+    }
+  }
+
+  func signUpWithPasskey(anchor: ASPresentationAnchor, displayName: String? = nil) async {
+    do {
+      try await sdkManager.signUpWithPasskey(anchor: anchor, displayName: displayName)
+    } catch let sdkError as RainSDKError {
+      error = sdkError
+    } catch {
+      self.error = RainSDKError.providerError(underlying: error)
+    }
+  }
+
+  /// Clear the active Turnkey session. Wallet provider is unbound automatically.
+  func signOut() {
+    sdkManager.signOut()
+  }
+
+  private func observeAuthState() {
+    authStateCancellable = sdkManager.authState
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] state in
+        self?.authState = state
+      }
   }
 
   /// Initialize the SDK in wallet-agnostic mode (without Portal token)
@@ -324,16 +355,11 @@ class RainSDKService: ObservableObject {
     CollateralWithdrawDemoViewModel()
   }
 
-  // MARK: - Portal Access
+  // MARK: - Provider Access
 
-  /// Check if SDK is initialized
+  /// True when the active provider is Portal. Used to gate Portal-only UI like the recover sheet.
   var hasPortal: Bool {
-    do {
-      _ = try sdkManager.portal
-      return true
-    } catch {
-      return false
-    }
+    activeProvider == .portal
   }
 
   /// True when any wallet provider (Portal or Turnkey) is active.
@@ -341,41 +367,20 @@ class RainSDKService: ObservableObject {
     activeProvider != .none
   }
 
-  /// Recovers the Portal wallet from backup.
-  /// - Parameters:
-  ///   - backupMethod: `.iCloud` or `.PIN` (password).
-  ///   - password: Required when backupMethod is `.PIN` (password); passed to `portal.setPassword` before recover.
-  ///   - cipherText: Encrypted backup data (e.g. from iCloud or password storage).
+  /// Recovers the Portal wallet from backup via Rain's facade.
   func recover(
-    backupMethod: BackupMethods,
+    method: RainPortalBackupMethod,
     password: String? = nil,
     cipherText: String
   ) async throws {
-    let portal = try getPortal()
-
-    if let password, backupMethod == .Password {
-      try portal.setPassword(password)
-    }
-
-    do {
-      _ = try await portal.recoverWallet(backupMethod, withCipherText: cipherText) { status in
-        print("Rain SDK: Recover status: \(status)")
-      }
-      print("Rain SDK: Wallet recover success")
-    } catch {
-      print("Rain SDK: Recover failed - \(error.localizedDescription)")
-      throw RainSDKError.providerError(underlying: error)
-    }
+    try await sdkManager.recoverPortalWallet(
+      method: method,
+      cipherText: cipherText,
+      password: password
+    )
   }
 
-  private func getPortal() throws -> Portal {
-    do {
-      return try sdkManager.portal
-    } catch {
-      throw RainSDKError.sdkNotInitialized
-    }
-  }
-  
+
   // MARK: - Reset
   
   /// Reset the SDK state
