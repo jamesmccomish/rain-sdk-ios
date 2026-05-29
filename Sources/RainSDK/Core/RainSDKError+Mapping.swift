@@ -48,14 +48,10 @@ extension RainSDKError {
   private static func mapPortalRequestsError(_ error: PortalRequestsError) -> RainSDKError {
     switch error {
     case .unauthorized:
+      // Portal routes HTTP 401 to .unauthorized upstream (see PortalRequests.buildError),
+      // so this is the only path token-expired errors reach the SDK through.
       return .tokenExpired
-    case .clientError(let message, _):
-      // Portal wording varies; match defensively on the message body.
-      if message.contains("SESSION_EXPIRED") || message.contains("401") {
-        return .tokenExpired
-      }
-      return .providerError(underlying: error)
-    case .internalServerError, .redirectError:
+    case .clientError, .internalServerError, .redirectError:
       return .providerError(underlying: error)
     default:
       return .providerError(underlying: error)
@@ -63,23 +59,18 @@ extension RainSDKError {
   }
 
   private static func mapPortalMpcError(_ error: PortalMpcError) -> RainSDKError {
-    // Common: session expired / invalid API key
     let code = error.id.flatMap { Int($0) }
     if code == 320 || code == PortalErrorCodes.INVALID_API_KEY.rawValue {
       return .tokenExpired
     }
-    
-    // BAD_REQUEST and all other codes: not mapped to userRejected (message wording varies by Portal; app can inspect underlying error)
     return .providerError(underlying: error)
   }
 
   private static func mapPortalRpcError(_ error: PortalRpcError) -> RainSDKError {
-    // Code `3` is returned for "execution reverted" — not declared by PortalSwift
+    // Code `3` is returned for "execution reverted" — not declared by PortalSwift.
     if error.code == 3 {
       return .withdrawalRevertedByNetwork
     }
-    
-    // BAD_REQUEST and all other codes: not mapped to userRejected (message wording varies by Portal; app can inspect underlying error)
     return .providerError(underlying: error)
   }
 

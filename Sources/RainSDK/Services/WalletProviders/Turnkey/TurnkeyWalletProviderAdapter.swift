@@ -28,17 +28,40 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
   private let transactionBuilder: TransactionBuilderProtocol?
   private let networkConfigsByChainId: [Int: NetworkConfig]
   private let walletAddressOverride: String?
+  private let jsonRpcClient: JsonRpcClient
+  private let chainReader: ChainReader
+  private let tokenStore: TokenMetadataStore
+
+  // Once resolved, the wallet address is stable for the adapter's lifetime, so cache it.
+  private var cachedAddress: String?
+  private let cachedAddressLock = NSLock()
 
   internal init(
     turnkey: TurnkeyContextProtocol,
     transactionBuilder: TransactionBuilderProtocol? = nil,
     networkConfigs: [NetworkConfig],
-    walletAddress: String? = nil
+    walletAddress: String? = nil,
+    jsonRpcClient: JsonRpcClient = JsonRpcClient(),
+    chainReader: ChainReader? = nil,
+    tokenStore: TokenMetadataStore? = nil
   ) {
     self.turnkey = turnkey
     self.transactionBuilder = transactionBuilder
     self.networkConfigsByChainId = Dictionary(uniqueKeysWithValues: networkConfigs.map { ($0.chainId, $0) })
     self.walletAddressOverride = walletAddress
+    self.jsonRpcClient = jsonRpcClient
+    let resolvedReader = chainReader ?? EVMChainReader(
+      jsonRpcClient: jsonRpcClient,
+      networkConfigs: networkConfigs
+    )
+    self.chainReader = resolvedReader
+    self.tokenStore = tokenStore ?? TokenMetadataStore(chainReader: resolvedReader)
+  }
+
+  /// True when Turnkey's `get-balances` API covers this chain. On any other chain,
+  /// balance reads fall through to the injected `ChainReader`.
+  private func usesTurnkeyForBalances(chainId: Int) -> Bool {
+    Constants.turnkeySupportedChains.contains(chainId)
   }
 
   public func address() async throws -> String {
@@ -46,17 +69,27 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
       return walletAddressOverride
     }
 
+    if let cached = cachedAddressLock.withLock({ cachedAddress }) {
+      return cached
+    }
+
     if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets) {
+      storeCachedAddress(walletAddress)
       return walletAddress
     }
 
     try await turnkey.refreshWallets()
 
     if let walletAddress = resolveEthereumWalletAddress(from: turnkey.wallets) {
+      storeCachedAddress(walletAddress)
       return walletAddress
     }
 
     throw RainSDKError.walletUnavailable
+  }
+
+  private func storeCachedAddress(_ address: String) {
+    cachedAddressLock.withLock { cachedAddress = address }
   }
 
   public func sendTransaction(
@@ -78,79 +111,104 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
     )
   }
 
-  public func getNativeBalance(
-    chainId: Int
-  ) async throws -> Double {
+  public func getBalance(
+    chainId: Int,
+    token: Token
+  ) async throws -> Balance {
     let walletAddress = try await address()
-    let balances = try await fetchBalances(
-      chainId: chainId,
-      walletAddress: walletAddress
-    )
 
-    let caip2 = Constants.ChainIDFormat.EIP155.format(chainId: chainId)
-    let nativeBalance = balances.first(where: { isNativeAsset($0, caip2: caip2) })
-
-    return decimalStringToDouble(
-      balance: nativeBalance?.balance,
-      decimals: nativeBalance?.decimals ?? Self.AdapterConstants.defaultNativeDecimals
-    )
+    switch token {
+    case .contract(let address):
+      // `eth_call balanceOf` is the same operation everywhere — delegate to the chain
+      // reader so the SDK has one implementation rather than per-adapter copies.
+      let info = await tokenStore.tokenInfo(chainId: chainId, address: address)
+      return try await chainReader.getBalance(
+        chainId: chainId,
+        walletAddress: walletAddress,
+        token: token,
+        tokenInfo: info
+      )
+    case .native:
+      if !usesTurnkeyForBalances(chainId: chainId) {
+        return try await chainReader.getBalance(
+          chainId: chainId,
+          walletAddress: walletAddress,
+          token: .native,
+          tokenInfo: nil
+        )
+      }
+      let balances = try await fetchBalances(chainId: chainId, walletAddress: walletAddress)
+      return await nativeBalance(
+        chainId: chainId,
+        from: balances,
+        caip2: ChainIDFormat.EIP155.format(chainId: chainId)
+      )
+    }
   }
 
-  public func getERC20Balance(
-    chainId: Int,
-    tokenAddress: String,
-    decimals: Int?
-  ) async throws -> Double {
-    guard let transactionBuilder else {
-      throw RainSDKError.sdkNotInitialized
+  public func getBalances(
+    chainId: Int
+  ) async throws -> [Balance] {
+    let walletAddress = try await address()
+
+    if !usesTurnkeyForBalances(chainId: chainId) {
+      let tokens = await tokenStore.registeredTokens(for: chainId)
+      let all = try await chainReader.getBalances(
+        chainId: chainId,
+        walletAddress: walletAddress,
+        tokens: tokens
+      )
+      return all.filter { balance in
+        if case .native = balance.token { return true }
+        return balance.rawAmount > 0
+      }
     }
 
-    let walletAddress = try await address()
-    let callData = try await transactionBuilder.encodeBalanceOfCall(
-      walletAddress: walletAddress,
-      chainId: chainId
-    )
-    let callParams: [String: Any] = [
-      "to": tokenAddress,
-      "data": callData
-    ]
+    let balances = try await fetchBalances(chainId: chainId, walletAddress: walletAddress)
+    let caip2 = ChainIDFormat.EIP155.format(chainId: chainId)
 
-    let response = try await rpcRequest(
-      chainId: chainId,
-      method: "eth_call",
-      params: [callParams, "latest"]
-    )
-    let hex = try extractHexResult(from: response, method: "eth_call")
-
-    return EthereumConverter.parseHexToDouble(
-      hex,
-      decimals: decimals ?? Constants.ERC20.defaultDecimals
-    )
-  }
-
-  public func getERC20Balances(
-    chainId: Int
-  ) async throws -> [String: Double] {
-    let walletAddress = try await address()
-    let balances = try await fetchBalances(
-      chainId: chainId,
-      walletAddress: walletAddress
-    )
-
-    let caip2 = Constants.ChainIDFormat.EIP155.format(chainId: chainId)
-
-    return balances.reduce(into: [:]) { partialResult, balance in
+    var output: [Balance] = [await nativeBalance(chainId: chainId, from: balances, caip2: caip2)]
+    for balance in balances {
       guard let caip19 = balance.caip19,
             let tokenAddress = tokenAddress(from: caip19, caip2: caip2)
       else {
-        return
+        continue
       }
-
-      partialResult[tokenAddress] = decimalStringToDouble(
-        balance: balance.balance,
-        decimals: balance.decimals ?? Constants.ERC20.defaultDecimals
+      let raw = BigUInt(balance.balance ?? "0") ?? 0
+      guard raw > 0 else { continue }
+      let info = await tokenStore.tokenInfo(chainId: chainId, address: tokenAddress)
+      output.append(
+        Balance(
+          token: .contract(address: tokenAddress),
+          chainId: chainId,
+          rawAmount: raw,
+          decimals: balance.decimals ?? info.decimals,
+          symbol: balance.symbol ?? info.symbol,
+          name: balance.name ?? info.name
+        )
       )
     }
+    return output
+  }
+
+  /// Builds the native `Balance` from a Turnkey asset list. Turnkey reports balances in raw
+  /// base units, so the string is parsed directly as `BigUInt` (no decimal reconstruction).
+  private func nativeBalance(
+    chainId: Int,
+    from balances: [v1AssetBalance],
+    caip2: String
+  ) async -> Balance {
+    let nativeAsset = balances.first(where: { isNativeAsset($0, caip2: caip2) })
+    let raw = BigUInt(nativeAsset?.balance ?? "0") ?? 0
+    let native = await tokenStore.nativeCurrency(for: chainId)
+    return Balance(
+      token: .native,
+      chainId: chainId,
+      rawAmount: raw,
+      decimals: nativeAsset?.decimals ?? native.decimals,
+      symbol: native.symbol,
+      name: native.name
+    )
   }
 
   public func getTransactions(
@@ -253,25 +311,19 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
     walletAddress: String,
     params: WalletTransactionParams
   ) async throws -> Double {
-    let estimateResponse = try await rpcRequest(
+    let estimateHex = try await rpcCallForHex(
       chainId: chainId,
       method: "eth_estimateGas",
       params: [rpcTransactionObject(from: params)]
     )
-    let gasPriceResponse = try await rpcRequest(
+    let gasPriceHex = try await rpcCallForHex(
       chainId: chainId,
       method: "eth_gasPrice",
       params: []
     )
 
-    let gasLimit = EthereumConverter.parseHexToDouble(
-      try extractHexResult(from: estimateResponse, method: "eth_estimateGas"),
-      decimals: 0
-    )
-    let gasPriceWei = EthereumConverter.parseHexToDouble(
-      try extractHexResult(from: gasPriceResponse, method: "eth_gasPrice"),
-      decimals: 0
-    )
+    let gasLimit = EthereumConverter.parseHexToDouble(estimateHex, decimals: 0)
+    let gasPriceWei = EthereumConverter.parseHexToDouble(gasPriceHex, decimals: 0)
 
     return gasLimit * gasPriceWei.weiToEth
   }
@@ -297,7 +349,7 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
       TGetWalletAddressBalancesBody(
         organizationId: session.organizationId,
         address: walletAddress,
-        caip2: Constants.ChainIDFormat.EIP155.format(chainId: chainId)
+        caip2: ChainIDFormat.EIP155.format(chainId: chainId)
       )
     )
 
@@ -309,35 +361,31 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
     chainId: Int,
     params: WalletTransactionParams
   ) async throws -> TEthSendTransactionBody {
-    let nonceResponse = try await rpcRequest(
+    let nonceHex = try await rpcCallForHex(
       chainId: chainId,
       method: "eth_getTransactionCount",
       params: [params.from, "pending"]
     )
-    let estimateGasResponse = try await rpcRequest(
+    let estimateGasHex = try await rpcCallForHex(
       chainId: chainId,
       method: "eth_estimateGas",
       params: [rpcTransactionObject(from: params)]
     )
-    let gasPriceResponse = try await rpcRequest(
+    let gasPriceHex = try await rpcCallForHex(
       chainId: chainId,
       method: "eth_gasPrice",
       params: []
     )
 
-    let nonce = decimalString(fromHex: try extractHexResult(from: nonceResponse, method: "eth_getTransactionCount"))
-    let estimatedGas = BigUInt(
-      decimalString(
-        fromHex: try extractHexResult(from: estimateGasResponse, method: "eth_estimateGas")
-      )
-    ) ?? BigUInt(21_000)
+    let nonce = decimalString(fromHex: nonceHex)
+    let estimatedGas = BigUInt(decimalString(fromHex: estimateGasHex)) ?? BigUInt(21_000)
     let bufferedGasLimit = estimatedGas + (estimatedGas / 5)
     let gasLimit = (bufferedGasLimit == 0 ? estimatedGas : bufferedGasLimit).description
-    let gasPrice = decimalString(fromHex: try extractHexResult(from: gasPriceResponse, method: "eth_gasPrice"))
+    let gasPrice = decimalString(fromHex: gasPriceHex)
 
     return TEthSendTransactionBody(
       organizationId: session.organizationId,
-      caip2: Constants.ChainIDFormat.EIP155.format(chainId: chainId),
+      caip2: ChainIDFormat.EIP155.format(chainId: chainId),
       data: normalizedData(params.data),
       from: params.from,
       gasLimit: gasLimit,
@@ -466,66 +514,18 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
     Int(caip2.split(separator: ":").last ?? "") ?? 0
   }
 
-  private func rpcRequest(
+  private func rpcCallForHex(
     chainId: Int,
     method: String,
     params: [Any]
-  ) async throws -> [String: Any] {
+  ) async throws -> String {
     let rpcURL = try getRpcURL(chainId: chainId)
-
-    guard let url = URL(string: rpcURL) else {
-      throw RainSDKError.invalidConfig(chainId: chainId, rpcUrl: rpcURL)
-    }
-
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONSerialization.data(
-      withJSONObject: [
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-      ]
-    )
-
     do {
-      let (data, _) = try await URLSession.shared.data(for: request)
-      guard let response = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw RainSDKError.internalLogicError(
-          details: "Unexpected RPC response payload for method \(method)"
-        )
-      }
-
-      if let error = response["error"] as? [String: Any] {
-        let code = error["code"] as? Int ?? -1
-        let message = error["message"] as? String ?? "Unknown RPC error"
-        throw NSError(
-          domain: "eth.rpc",
-          code: code,
-          userInfo: [NSLocalizedDescriptionKey: message]
-        )
-      }
-
-      return response
-    } catch let error as RainSDKError {
-      throw error
-    } catch {
-      throw RainSDKError.from(underlying: error)
+      return try await jsonRpcClient.callForHexResult(rpcUrl: rpcURL, method: method, params: params)
+    } catch RainSDKError.invalidRpcUrl(let url) {
+      // Upgrade to invalidConfig with the chainId we have on hand.
+      throw RainSDKError.invalidConfig(chainId: chainId, rpcUrl: url)
     }
-  }
-
-  private func extractHexResult(
-    from response: [String: Any],
-    method: String
-  ) throws -> String {
-    guard let result = response["result"] as? String else {
-      throw RainSDKError.internalLogicError(
-        details: "Unexpected RPC result for method \(method)"
-      )
-    }
-
-    return result
   }
 
   private func rpcTransactionObject(from params: WalletTransactionParams) -> [String: Any] {
@@ -569,8 +569,7 @@ internal final class TurnkeyWalletProviderAdapter: RainWalletProvider, RainTyped
   }
 
   private func decimalString(fromHex hex: String) -> String {
-    let cleanHex = hex.hasPrefix("0x") ? String(hex.dropFirst(2)) : hex
-    guard let value = BigUInt(cleanHex, radix: 16) else {
+    guard let value = BigUInt(hex.strippingHexPrefix, radix: 16) else {
       return "0"
     }
 

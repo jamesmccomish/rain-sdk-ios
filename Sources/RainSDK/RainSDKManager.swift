@@ -23,13 +23,15 @@ public final class RainSDKManager: RainSDK {
   private var _transactionBuilder: TransactionBuilderProtocol?
   
   private var _networkConfigs: [NetworkConfig] = []
-  
-  /// Computed property to safely access the Portal instance
-  /// Returns Portal (concrete type) for public API compatibility
-  /// 
-  /// - Note: This property can only be accessed when a real Portal instance is initialized.
-  ///         When using mocks (e.g., MockPortal) for testing, this property will throw an error.
-  ///         Use `portalProtocol` property for testing with mocks.
+
+  /// Token metadata store shared with the active wallet provider. Nil in wallet-agnostic mode.
+  private var _tokenStore: TokenMetadataStore?
+
+  /// Host-registered tokens, retained so they re-seed the store on each (re)initialization.
+  private var _registeredTokens: [TokenInfo] = []
+
+  /// Throws `sdkNotInitialized` if Portal has not been initialized, or if the stored
+  /// `PortalRequestProtocol` is a mock (use `portalProtocol` for test contexts).
   public var portal: Portal {
     get throws {
       guard let portalProtocol = _portal
@@ -47,10 +49,8 @@ public final class RainSDKManager: RainSDK {
     }
   }
 
-  /// Computed property to safely access the Turnkey context
-  ///
-  /// - Note: This property can only be accessed when a real `TurnkeyContext` is initialized.
-  ///         When using mocks for testing, this property will throw an error.
+  /// Throws `sdkNotInitialized` if Turnkey has not been initialized, or if the stored
+  /// context is a mock.
   public var turnkey: TurnkeyContext {
     get throws {
       guard let turnkeyProtocol = _turnkey else {
@@ -85,49 +85,42 @@ public final class RainSDKManager: RainSDK {
   }
   
   // MARK: - Initialization
-  public init(
-  ) {}
-  
-  /// Internal initializer for testing - allows injecting a custom transaction builder
-  internal init(
-    transactionBuilder: TransactionBuilderProtocol?
-  ) {
-    self._transactionBuilder = transactionBuilder
-  }
-  
-  /// Internal initializer for testing - allows injecting both Portal and transaction builder
-  internal init(
-    portal: PortalRequestProtocol?,
-    transactionBuilder: TransactionBuilderProtocol?
-  ) {
-    self._portal = portal
-    self._turnkey = nil
-    self._transactionBuilder = transactionBuilder
-    self._walletProvider = portal.map {
-      PortalWalletProviderAdapter(
-        portal: $0,
-        transactionBuilder: transactionBuilder
-      )
-    }
-  }
+  public init() {}
 
-  /// Internal initializer for testing - allows injecting Turnkey and transaction builder
+  /// Designated internal initializer used by tests to inject any combination of Portal,
+  /// Turnkey, and transaction-builder mocks. Pass `portal` *or* `turnkey` (not both);
+  /// the wallet provider is built from whichever is supplied.
   internal init(
-    turnkey: TurnkeyContextProtocol?,
-    transactionBuilder: TransactionBuilderProtocol?,
+    portal: PortalRequestProtocol? = nil,
+    turnkey: TurnkeyContextProtocol? = nil,
+    transactionBuilder: TransactionBuilderProtocol? = nil,
     networkConfigs: [NetworkConfig] = [],
     walletAddress: String? = nil
   ) {
-    self._portal = nil
+    self._portal = portal
     self._turnkey = turnkey
     self._transactionBuilder = transactionBuilder
     self._networkConfigs = networkConfigs
-    self._walletProvider = turnkey.map {
-      TurnkeyWalletProviderAdapter(
-        turnkey: $0,
+
+    let reader = EVMChainReader(networkConfigs: networkConfigs)
+    let store = TokenMetadataStore(chainReader: reader)
+
+    if let portal {
+      self._tokenStore = store
+      self._walletProvider = PortalWalletProviderAdapter(
+        portal: portal,
+        transactionBuilder: transactionBuilder,
+        tokenStore: store
+      )
+    } else if let turnkey {
+      self._tokenStore = store
+      self._walletProvider = TurnkeyWalletProviderAdapter(
+        turnkey: turnkey,
         transactionBuilder: transactionBuilder,
         networkConfigs: networkConfigs,
-        walletAddress: walletAddress
+        walletAddress: walletAddress,
+        chainReader: reader,
+        tokenStore: store
       )
     }
   }
@@ -138,10 +131,10 @@ public final class RainSDKManager: RainSDK {
   ) async throws {
     // Validate inputs
     try validateInputs(portalSessionToken: portalSessionToken, networkConfigs: networkConfigs)
-    
+
     // Store network configs
     _networkConfigs = networkConfigs
-    
+
     // Convert network configs to Portal format
     let eip155RpcEndpointsConfig = try buildRpcConfig(from: networkConfigs)
     
@@ -162,9 +155,13 @@ public final class RainSDKManager: RainSDK {
       // Initialize transaction builder service with network configs
       let transactionBuilder = TransactionBuilderService(networkConfigs: networkConfigs)
       _transactionBuilder = transactionBuilder
+      let reader = EVMChainReader(networkConfigs: networkConfigs)
+      let store = TokenMetadataStore(chainReader: reader, seedTokens: _registeredTokens)
+      _tokenStore = store
       _walletProvider = PortalWalletProviderAdapter(
         portal: portal,
-        transactionBuilder: transactionBuilder
+        transactionBuilder: transactionBuilder,
+        tokenStore: store
       )
       
       RainLogger.info("Rain SDK: Registered Portal instance successfully with \(networkConfigs.count) network(s)")
@@ -185,11 +182,15 @@ public final class RainSDKManager: RainSDK {
     try validateNetworkConfigs(networkConfigs)
 
     let transactionBuilder = TransactionBuilderService(networkConfigs: networkConfigs)
+    let reader = EVMChainReader(networkConfigs: networkConfigs)
+    let store = TokenMetadataStore(chainReader: reader, seedTokens: _registeredTokens)
     let provider = TurnkeyWalletProviderAdapter(
       turnkey: turnkey,
       transactionBuilder: transactionBuilder,
       networkConfigs: networkConfigs,
-      walletAddress: walletAddress
+      walletAddress: walletAddress,
+      chainReader: reader,
+      tokenStore: store
     )
 
     do {
@@ -199,6 +200,7 @@ public final class RainSDKManager: RainSDK {
       _portal = nil
       _turnkey = turnkey
       _transactionBuilder = transactionBuilder
+      _tokenStore = store
       _walletProvider = provider
 
       RainLogger.info("Rain SDK: Registered Turnkey context successfully with \(networkConfigs.count) network(s)")
@@ -213,13 +215,14 @@ public final class RainSDKManager: RainSDK {
   ) async throws {
     // Validate network configs
     try validateNetworkConfigs(networkConfigs)
-    
+
     // Store network configs; no wallet provider in wallet-agnostic mode
     _networkConfigs = networkConfigs
     _portal = nil
     _turnkey = nil
     _walletProvider = nil
-    
+    _tokenStore = nil
+
     // Initialize transaction builder service with network configs
     _transactionBuilder = TransactionBuilderService(networkConfigs: networkConfigs)
     
@@ -228,6 +231,20 @@ public final class RainSDKManager: RainSDK {
 
   public func setWalletProvider(_ provider: (any RainWalletProvider)?) {
     _walletProvider = provider
+  }
+
+  /// Clears all SDK state — wallet provider, Portal/Turnkey instances, transaction
+  /// builder, and network configs. After this returns, the SDK is back to the same
+  /// state as immediately after `init()`. Idempotent.
+  public func reset() {
+    _portal = nil
+    _turnkey = nil
+    _walletProvider = nil
+    _transactionBuilder = nil
+    _networkConfigs = []
+    _tokenStore = nil
+    _registeredTokens = []
+    RainLogger.info("Rain SDK: Reset SDK state")
   }
 
   public func buildEIP712Message(
@@ -470,72 +487,65 @@ public final class RainSDKManager: RainSDK {
 
   // MARK: - Fetch balances
 
-  /// Fetches the native token balance (e.g. ETH) for the current wallet on the given network via the wallet provider.
-  public func getNativeBalance(
-    chainId: Int
-  ) async throws -> Double {
-    do {
-      guard let provider = _walletProvider else {
-        throw RainSDKError.walletUnavailable
-      }
-      
-      return try await provider.getNativeBalance(chainId: chainId)
-    } catch {
-      throw RainSDKError.from(underlying: error)
-    }
-  }
-
-  /// Fetches the ERC-20 balance for a single token via direct RPC `eth_call` (balanceOf).
-  public func getERC20Balance(
+  /// Fetches a single balance (native or a contract token) for the current wallet via the wallet provider.
+  public func getBalance(
     chainId: Int,
-    tokenAddress: String,
-    decimals: Int? = Constants.ERC20.defaultDecimals
-  ) async throws -> Double {
+    token: Token
+  ) async throws -> Balance {
     do {
       guard let provider = _walletProvider else {
         throw RainSDKError.walletUnavailable
       }
 
-      return try await provider.getERC20Balance(
-        chainId: chainId,
-        tokenAddress: tokenAddress,
-        decimals: decimals
-      )
-    } catch {
-      throw RainSDKError.from(underlying: error)
-    }
-  }
-  
-  /// Fetches ERC-20 token balances for the current wallet on the given network via the wallet provider.
-  public func getERC20Balances(
-    chainId: Int
-  ) async throws -> [String: Double] {
-    do {
-      guard let provider = _walletProvider else {
-        throw RainSDKError.walletUnavailable
-      }
-      
-      return try await provider.getERC20Balances(chainId: chainId)
+      return try await provider.getBalance(chainId: chainId, token: token)
     } catch {
       throw RainSDKError.from(underlying: error)
     }
   }
 
-  /// Fetches all balances (native + ERC-20) for the current wallet via the wallet provider. Native balance is stored under key `""`.
+  /// Fetches all non-zero balances (native always included) for the current wallet on the given network.
   public func getBalances(
     chainId: Int
-  ) async throws -> [String: Double] {
+  ) async throws -> [Balance] {
     do {
       guard let provider = _walletProvider else {
         throw RainSDKError.walletUnavailable
       }
-      
-      var result = try await provider.getERC20Balances(chainId: chainId)
-      result[""] = try await provider.getNativeBalance(chainId: chainId)
-      
-      return result
+
+      return try await provider.getBalances(chainId: chainId)
     } catch {
       throw RainSDKError.from(underlying: error)
+    }
+  }
+
+  /// Fetches balances across every configured chain in parallel, flattened into one list.
+  /// Each `Balance` carries its own `chainId`. A chain that fails contributes no entries
+  /// rather than failing the whole call, so one bad RPC endpoint doesn't hide the others.
+  public func getAllBalances() async throws -> [Balance] {
+    guard let provider = _walletProvider else {
+      throw RainSDKError.walletUnavailable
+    }
+    let chainIds = _networkConfigs.map(\.chainId)
+    return await withTaskGroup(of: [Balance].self) { group in
+      for chainId in chainIds {
+        group.addTask {
+          (try? await provider.getBalances(chainId: chainId)) ?? []
+        }
+      }
+      var output: [Balance] = []
+      for await balances in group {
+        output.append(contentsOf: balances)
+      }
+      return output
+    }
+  }
+
+  /// Registers additional tokens so their metadata resolves from the store without an
+  /// on-chain enrichment call. Retained across re-initialization; cleared by `reset()`.
+  public func registerTokens(_ tokens: [TokenInfo]) {
+    _registeredTokens.append(contentsOf: tokens)
+    if let store = _tokenStore {
+      Task { await store.register(tokens) }
     }
   }
 
